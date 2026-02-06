@@ -2,6 +2,7 @@
 """
 Fetch newly added Indian movies, web-series, and documentaries from major
 streaming platforms using the Streaming Availability API on RapidAPI.
+Optionally email the results as an Excel attachment via Gmail SMTP.
 
 Platforms queried:
   US region : Netflix, Prime Video, Hulu, Zee5
@@ -13,17 +14,31 @@ Note: Aha and SunNxt are not supported by the Streaming Availability API.
 
 Usage:
     export RAPIDAPI_KEY="your-rapidapi-key"
+
+    # Optional – enable email delivery:
+    export SENDER_EMAIL="you@gmail.com"
+    export SENDER_PASSWORD="xxxx xxxx xxxx xxxx"   # Gmail App Password
+    export RECIPIENT_EMAIL="recipient@example.com"
+
     python indian_streaming_content.py
 """
 
 import csv
 import logging
 import os
+import smtplib
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import requests
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -31,9 +46,16 @@ import requests
 
 API_KEY = os.environ.get("RAPIDAPI_KEY", "")
 BASE_URL = "https://streaming-availability.p.rapidapi.com"
-OUTPUT_FILE = "indian_streaming_content.csv"
+OUTPUT_CSV = "indian_streaming_content.csv"
 LOOKBACK_DAYS = 7
 CSV_FIELDS = ["title", "year", "type", "languages", "platform", "country", "date_added"]
+
+# Email settings (all optional — email is skipped when any is missing).
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "")
+RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
 
 # Catalogs to query per country.  Only services that the API actually
 # supports in each region are listed here.
@@ -193,6 +215,176 @@ def readable_languages(show):
 
 
 # ---------------------------------------------------------------------------
+# Excel output
+# ---------------------------------------------------------------------------
+
+def write_excel(rows, path):
+    """Write *rows* (list of dicts) to an .xlsx file with basic formatting."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "New Releases"
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+
+    # Header row
+    for col_idx, field in enumerate(CSV_FIELDS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=field)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    # Data rows
+    for row_idx, row in enumerate(rows, start=2):
+        for col_idx, field in enumerate(CSV_FIELDS, start=1):
+            ws.cell(row=row_idx, column=col_idx, value=row.get(field, ""))
+
+    # Auto-width (approximate)
+    for col_idx, field in enumerate(CSV_FIELDS, start=1):
+        max_len = len(field)
+        for row in rows:
+            val = str(row.get(field, ""))
+            if len(val) > max_len:
+                max_len = len(val)
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 4, 50)
+
+    wb.save(path)
+    log.info("Wrote Excel file to %s", path)
+
+
+# ---------------------------------------------------------------------------
+# Email
+# ---------------------------------------------------------------------------
+
+def _build_summary(rows):
+    """Return a string summarising release counts by country and platform."""
+    by_country = Counter()
+    by_combo = Counter()
+    for r in rows:
+        by_country[r["country"]] += 1
+        by_combo[(r["country"], r["platform"])] += 1
+
+    lines = [f"Total new Indian releases found: {len(rows)}"]
+    for country in ("US", "IN"):
+        if by_country[country]:
+            lines.append(f"\n  {country}: {by_country[country]} title(s)")
+            for (c, p), n in sorted(by_combo.items()):
+                if c == country:
+                    lines.append(f"    - {p}: {n}")
+    return "\n".join(lines)
+
+
+def _build_html_body(rows):
+    """Build an HTML email body with a summary and a top-5 US releases table."""
+    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    # --- summary counts ---
+    by_country = Counter()
+    by_combo = Counter()
+    for r in rows:
+        by_country[r["country"]] += 1
+        by_combo[(r["country"], r["platform"])] += 1
+
+    summary_rows = ""
+    for country in ("US", "IN"):
+        for (c, p), n in sorted(by_combo.items()):
+            if c == country:
+                summary_rows += (
+                    f"<tr><td>{c}</td><td>{p}</td>"
+                    f"<td style='text-align:center'>{n}</td></tr>\n"
+                )
+
+    # --- top 5 US releases ---
+    us_rows = [r for r in rows if r["country"] == "US"][:5]
+    top5_html = ""
+    for r in us_rows:
+        top5_html += (
+            f"<tr>"
+            f"<td>{r['title']}</td>"
+            f"<td style='text-align:center'>{r['year']}</td>"
+            f"<td>{r['type']}</td>"
+            f"<td>{r['platform']}</td>"
+            f"<td style='text-align:center'>{r['date_added']}</td>"
+            f"</tr>\n"
+        )
+    if not top5_html:
+        top5_html = "<tr><td colspan='5' style='text-align:center'>No US releases found</td></tr>"
+
+    return f"""\
+<html>
+<body style="font-family:Arial,sans-serif;color:#333">
+<h2>New Indian Movies &amp; Shows &mdash; {today}</h2>
+
+<h3>Summary by Platform &amp; Country</h3>
+<table border="1" cellpadding="6" cellspacing="0"
+       style="border-collapse:collapse;min-width:320px">
+  <tr style="background:#4472C4;color:#fff">
+    <th>Country</th><th>Platform</th><th>Count</th>
+  </tr>
+  {summary_rows}
+  <tr style="font-weight:bold">
+    <td colspan="2">Grand Total</td>
+    <td style="text-align:center">{len(rows)}</td>
+  </tr>
+</table>
+
+<h3>Top 5 US Releases</h3>
+<table border="1" cellpadding="6" cellspacing="0"
+       style="border-collapse:collapse;min-width:520px">
+  <tr style="background:#4472C4;color:#fff">
+    <th>Title</th><th>Year</th><th>Type</th><th>Platform</th><th>Date Added</th>
+  </tr>
+  {top5_html}
+</table>
+
+<p style="margin-top:18px;font-size:0.9em;color:#888">
+  Full data is attached as an Excel file.
+</p>
+</body>
+</html>"""
+
+
+def send_email(rows, excel_path):
+    """Send the results email with the Excel attachment via Gmail SMTP/TLS."""
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    msg = MIMEMultipart("mixed")
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = RECIPIENT_EMAIL
+    msg["Subject"] = f"New Indian Movies & Shows - {today_str}"
+
+    # HTML body
+    html_body = _build_html_body(rows)
+    msg.attach(MIMEText(html_body, "html"))
+
+    # Excel attachment
+    attachment_name = f"new_releases_{today_str}.xlsx"
+    with open(excel_path, "rb") as fh:
+        part = MIMEBase("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        part.set_payload(fh.read())
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f"attachment; filename={attachment_name}")
+    msg.attach(part)
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
+        log.info("Email sent successfully to %s", RECIPIENT_EMAIL)
+    except smtplib.SMTPAuthenticationError:
+        log.error(
+            "SMTP authentication failed. Verify SENDER_EMAIL and "
+            "SENDER_PASSWORD (must be a Gmail App Password, not your "
+            "regular password)."
+        )
+    except smtplib.SMTPException as exc:
+        log.error("Failed to send email: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -280,12 +472,26 @@ def main():
         platform_order.get(r["platform"], 99),                # within groups
     ))
 
-    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as fh:
+    # Write CSV
+    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
 
-    log.info("Wrote %d record(s) to %s", len(rows), OUTPUT_FILE)
+    log.info("Wrote %d record(s) to %s", len(rows), OUTPUT_CSV)
+
+    # Write Excel and (optionally) email it
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    excel_path = f"new_releases_{today_str}.xlsx"
+    write_excel(rows, excel_path)
+
+    if SENDER_EMAIL and SENDER_PASSWORD and RECIPIENT_EMAIL:
+        send_email(rows, excel_path)
+    else:
+        log.info(
+            "Email skipped — set SENDER_EMAIL, SENDER_PASSWORD, and "
+            "RECIPIENT_EMAIL to enable."
+        )
 
 
 if __name__ == "__main__":
