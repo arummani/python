@@ -319,12 +319,11 @@ def _build_html_body(rows):
     if not top5_html:
         top5_html = "<tr><td colspan='5' style='text-align:center'>No US releases found</td></tr>"
 
-    # --- top Tamil releases (newest first, deduplicated) ---
-    tamil_rows = sorted(
-        [r for r in rows if _is_tamil(r)],
-        key=lambda r: r["date_added"],
-        reverse=True,
-    )
+    # --- top Tamil releases: US first → IN → others, newest first ---
+    tamil_country_order = {"US": 0, "IN": 1}
+    tamil_rows = [r for r in rows if _is_tamil(r)]
+    tamil_rows.sort(key=lambda r: r["date_added"], reverse=True)      # newest first
+    tamil_rows.sort(key=lambda r: tamil_country_order.get(r["country"], 99))  # US → IN
     if tamil_rows:
         tamil_html = ""
         for r in tamil_rows:
