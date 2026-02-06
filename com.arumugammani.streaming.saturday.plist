@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+  <key>Label</key>
+  <string>com.arumugammani.streaming.saturday</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>cd /Users/arumugammani/Documents/GIT/python &amp;&amp; source .venv/bin/activate &amp;&amp; python indian_streaming_content.py</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>6</integer>
+    <key>Hour</key>
+    <integer>20</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/arumugammani/Documents/GIT/python/cron_streaming.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/arumugammani/Documents/GIT/python/cron_streaming.log</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/arumugammani/Documents/GIT/python</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+</dict>
+</plist>
