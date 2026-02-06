@@ -274,8 +274,17 @@ def _build_summary(rows):
     return "\n".join(lines)
 
 
+def _is_tamil(row):
+    """Return True if the row's languages field includes Tamil."""
+    langs_lower = row.get("languages", "").lower()
+    # Match the readable name "Tamil" as well as the short code "ta".
+    # Split on ", " so that "ta" doesn't false-match inside longer words.
+    tokens = {t.strip() for t in langs_lower.split(",")}
+    return "tamil" in tokens or "ta" in tokens
+
+
 def _build_html_body(rows):
-    """Build an HTML email body with a summary and a top-5 US releases table."""
+    """Build an HTML email body with summary, top-5 US, and Tamil releases."""
     today = datetime.now(timezone.utc).strftime("%B %d, %Y")
 
     # --- summary counts ---
@@ -310,6 +319,41 @@ def _build_html_body(rows):
     if not top5_html:
         top5_html = "<tr><td colspan='5' style='text-align:center'>No US releases found</td></tr>"
 
+    # --- top Tamil releases (newest first, deduplicated) ---
+    tamil_rows = sorted(
+        [r for r in rows if _is_tamil(r)],
+        key=lambda r: r["date_added"],
+        reverse=True,
+    )
+    if tamil_rows:
+        tamil_html = ""
+        for r in tamil_rows:
+            tamil_html += (
+                f"<tr>"
+                f"<td>{r['title']}</td>"
+                f"<td style='text-align:center'>{r['year']}</td>"
+                f"<td>{r['type']}</td>"
+                f"<td>{r['platform']}</td>"
+                f"<td>{r['country']}</td>"
+                f"<td style='text-align:center'>{r['date_added']}</td>"
+                f"<td>{r['languages']}</td>"
+                f"</tr>\n"
+            )
+        tamil_section = f"""\
+<h3>Top Tamil Releases</h3>
+<table border="1" cellpadding="6" cellspacing="0"
+       style="border-collapse:collapse;min-width:620px">
+  <tr style="background:#4472C4;color:#fff">
+    <th>Title</th><th>Year</th><th>Type</th><th>Platform</th>
+    <th>Country</th><th>Date Added</th><th>Languages</th>
+  </tr>
+  {tamil_html}
+</table>"""
+    else:
+        tamil_section = """\
+<h3>Top Tamil Releases</h3>
+<p><em>No new Tamil releases in this period.</em></p>"""
+
     return f"""\
 <html>
 <body style="font-family:Arial,sans-serif;color:#333">
@@ -336,6 +380,8 @@ def _build_html_body(rows):
   </tr>
   {top5_html}
 </table>
+
+{tamil_section}
 
 <p style="margin-top:18px;font-size:0.9em;color:#888">
   Full data is attached as an Excel file.
