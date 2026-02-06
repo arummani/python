@@ -268,8 +268,17 @@ def main():
                 "date_added": date_added,
             })
 
-    # Sort newest first, then by title
-    rows.sort(key=lambda r: (r["date_added"], r["title"]), reverse=True)
+    # Sort: US first then IN → platform (Netflix, Prime Video, Hulu, …)
+    # → date_added newest-first.  Two stable sorts achieve this cleanly.
+    country_order = {"US": 0, "IN": 1}
+    platform_order = {"Netflix": 0, "Prime Video": 1, "Hulu": 2,
+                      "Hotstar": 3, "Zee5": 4}
+
+    rows.sort(key=lambda r: r["date_added"], reverse=True)   # newest first
+    rows.sort(key=lambda r: (                                 # stable: keeps
+        country_order.get(r["country"], 99),                  # date order
+        platform_order.get(r["platform"], 99),                # within groups
+    ))
 
     with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
