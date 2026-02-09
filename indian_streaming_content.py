@@ -61,6 +61,13 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 
+# Rate-limit / throttle settings for the Streaming Availability API.
+MAX_RETRIES = 5             # retries per request on HTTP 429
+BACKOFF_BASE = 2            # exponential base (2s, 4s, 8s …)
+BACKOFF_CAP = 60            # never sleep longer than this (seconds)
+PAGE_DELAY = 0.3            # seconds to sleep between consecutive API calls
+MAX_PAGES_PER_REGION = 20   # stop paging after this many pages per region
+
 # Catalogs to query per country.  Only services that the API actually
 # supports in each region are listed here.
 COUNTRY_CATALOGS = {
@@ -109,6 +116,10 @@ log = logging.getLogger(__name__)
 # API helpers
 # ---------------------------------------------------------------------------
 
+class RateLimitExhausted(Exception):
+    """All retries exhausted on HTTP 429 — caller should handle gracefully."""
+
+
 def _headers():
     return {
         "X-RapidAPI-Key": API_KEY,
@@ -116,31 +127,62 @@ def _headers():
     }
 
 
-def _api_get(path, params, max_retries=3):
-    """GET with simple retry + back-off for transient errors."""
-    url = f"{BASE_URL}{path}"
+def call_with_backoff(method, url, *, params=None, headers=None,
+                      timeout=30, max_retries=MAX_RETRIES):
+    """HTTP request with Retry-After / exponential back-off on 429.
+
+    Returns a ``requests.Response`` on success.
+    Raises ``RateLimitExhausted`` if all retries fail on 429.
+    Raises ``requests.HTTPError`` for other HTTP errors.
+    """
     for attempt in range(1, max_retries + 1):
-        resp = requests.get(url, headers=_headers(), params=params, timeout=30)
-        if resp.status_code == 429:
-            wait = 2 ** attempt
-            log.warning("Rate-limited (429). Retrying in %ds…", wait)
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        return resp.json()
-    resp.raise_for_status()  # will raise on last failure
+        resp = requests.request(
+            method, url, params=params, headers=headers, timeout=timeout,
+        )
+        if resp.status_code != 429:
+            resp.raise_for_status()
+            return resp
+
+        # --- 429 handling ---
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after:
+            try:
+                wait = min(float(retry_after), BACKOFF_CAP)
+            except ValueError:
+                wait = min(BACKOFF_BASE ** attempt, BACKOFF_CAP)
+        else:
+            wait = min(BACKOFF_BASE ** attempt, BACKOFF_CAP)
+
+        log.warning(
+            "Rate-limited (429) on %s — retry %d/%d in %.1fs",
+            url, attempt, max_retries, wait,
+        )
+        time.sleep(wait)
+
+    # All retries exhausted
+    log.error(
+        "Rate limit persists after %d retries for %s — giving up.",
+        max_retries, url,
+    )
+    raise RateLimitExhausted(f"429 after {max_retries} retries: {url}")
 
 
 def fetch_changes(country, catalogs, from_timestamp):
-    """
-    Page through the /changes endpoint and return (changes, shows).
+    """Page through the /changes endpoint and return (changes, shows).
 
-    changes : list of change objects
-    shows   : dict mapping show-id -> show object
+    All catalogs for a region are sent in a single comma-separated request
+    (the API accepts up to 32 catalogs at once) to minimise call count.
+
+    Pagination is capped at ``MAX_PAGES_PER_REGION`` pages.  A small delay
+    of ``PAGE_DELAY`` seconds is inserted between pages.
+
+    If a ``RateLimitExhausted`` error occurs mid-pagination, whatever data
+    has been collected so far is returned with a warning.
     """
     all_changes = []
     all_shows = {}
     cursor = None
+    page = 0
 
     while True:
         params = {
@@ -153,14 +195,36 @@ def fetch_changes(country, catalogs, from_timestamp):
         if cursor:
             params["cursor"] = cursor
 
-        data = _api_get("/changes", params)
+        try:
+            resp = call_with_backoff(
+                "GET", f"{BASE_URL}/changes",
+                params=params, headers=_headers(),
+            )
+        except RateLimitExhausted:
+            log.warning(
+                "Rate limit exhausted for %s after %d page(s) — "
+                "continuing with %d change(s) already collected.",
+                country.upper(), page, len(all_changes),
+            )
+            break
+
+        data = resp.json()
         all_changes.extend(data.get("changes", []))
         all_shows.update(data.get("shows", {}))
+        page += 1
 
-        if data.get("hasMore"):
-            cursor = data.get("nextCursor")
-        else:
+        if not data.get("hasMore"):
             break
+
+        if page >= MAX_PAGES_PER_REGION:
+            log.info(
+                "Reached page cap (%d) for %s — stopping pagination.",
+                MAX_PAGES_PER_REGION, country.upper(),
+            )
+            break
+
+        cursor = data.get("nextCursor")
+        time.sleep(PAGE_DELAY)  # throttle between pages
 
     return all_changes, all_shows
 
@@ -512,15 +576,20 @@ def main():
     rows = []
     seen = set()
 
-    for country, catalogs in COUNTRY_CATALOGS.items():
+    regions = list(COUNTRY_CATALOGS.items())
+    for idx, (country, catalogs) in enumerate(regions):
         log.info("Querying %s — catalogs: %s", country.upper(), ", ".join(catalogs))
         try:
             changes, shows = fetch_changes(country, catalogs, from_ts)
         except requests.HTTPError as exc:
-            log.error("API error for %s: %s", country.upper(), exc)
+            log.error("API error for %s: %s — skipping region.", country.upper(), exc)
             continue
 
         log.info("  %d change(s) returned, %d unique show(s)", len(changes), len(shows))
+
+        # Throttle between regions
+        if idx < len(regions) - 1:
+            time.sleep(PAGE_DELAY)
 
         for change in changes:
             show_id = change.get("showId")
