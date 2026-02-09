@@ -14,6 +14,7 @@ Note: Aha and SunNxt are not supported by the Streaming Availability API.
 
 Usage:
     export RAPIDAPI_KEY="your-rapidapi-key"
+    export OMDB_API_KEY="your-omdb-key"       # free at https://www.omdbapi.com/apikey.aspx
 
     # Optional – enable email delivery:
     export SENDER_EMAIL="you@gmail.com"
@@ -45,10 +46,13 @@ from openpyxl.styles import Alignment, Font, PatternFill
 # ---------------------------------------------------------------------------
 
 API_KEY = os.environ.get("RAPIDAPI_KEY", "")
+OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "")
 BASE_URL = "https://streaming-availability.p.rapidapi.com"
+OMDB_URL = "http://www.omdbapi.com/"
 OUTPUT_CSV = "indian_streaming_content.csv"
 LOOKBACK_DAYS = 7
-CSV_FIELDS = ["title", "year", "type", "languages", "platform", "country", "date_added"]
+CSV_FIELDS = ["title", "year", "type", "languages", "platform", "country", "date_added",
+              "imdb_rating"]
 
 # Email settings (all optional — email is skipped when any is missing).
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")
@@ -159,6 +163,51 @@ def fetch_changes(country, catalogs, from_timestamp):
             break
 
     return all_changes, all_shows
+
+
+# ---------------------------------------------------------------------------
+# OMDb / IMDb ratings
+# ---------------------------------------------------------------------------
+
+def fetch_imdb_ratings(rows):
+    """Look up IMDb ratings for every unique imdbId in *rows*.
+
+    Returns a dict ``{imdb_id: float|None}``.  Results are cached in-memory
+    so the same id is never requested twice in one run.
+    """
+    if not OMDB_API_KEY:
+        log.warning("OMDB_API_KEY not set — skipping IMDb rating lookups.")
+        return {}
+
+    cache = {}
+    unique_ids = {r["imdb_id"] for r in rows if r.get("imdb_id")}
+    log.info("Fetching IMDb ratings for %d unique title(s)…", len(unique_ids))
+
+    for imdb_id in unique_ids:
+        if imdb_id in cache:
+            continue
+        try:
+            resp = requests.get(
+                OMDB_URL,
+                params={"apikey": OMDB_API_KEY, "i": imdb_id},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            raw = data.get("imdbRating", "N/A")
+            cache[imdb_id] = float(raw) if raw != "N/A" else None
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("Could not fetch rating for %s: %s", imdb_id, exc)
+            cache[imdb_id] = None
+
+    return cache
+
+
+def _fmt_rating(val):
+    """Format a rating for HTML display: one decimal or '–'."""
+    if val is None:
+        return "\u2013"  # en-dash
+    return f"{val:.1f}"
 
 
 # ---------------------------------------------------------------------------
@@ -314,10 +363,11 @@ def _build_html_body(rows):
             f"<td>{r['type']}</td>"
             f"<td>{r['platform']}</td>"
             f"<td style='text-align:center'>{r['date_added']}</td>"
+            f"<td style='text-align:center'>{_fmt_rating(r.get('imdb_rating'))}</td>"
             f"</tr>\n"
         )
     if not top5_html:
-        top5_html = "<tr><td colspan='5' style='text-align:center'>No US releases found</td></tr>"
+        top5_html = "<tr><td colspan='6' style='text-align:center'>No US releases found</td></tr>"
 
     # --- top Tamil releases: US first → IN → others, newest first ---
     tamil_country_order = {"US": 0, "IN": 1}
@@ -336,15 +386,16 @@ def _build_html_body(rows):
                 f"<td>{r['country']}</td>"
                 f"<td style='text-align:center'>{r['date_added']}</td>"
                 f"<td>{r['languages']}</td>"
+                f"<td style='text-align:center'>{_fmt_rating(r.get('imdb_rating'))}</td>"
                 f"</tr>\n"
             )
         tamil_section = f"""\
 <h3>Top Tamil Releases</h3>
 <table border="1" cellpadding="6" cellspacing="0"
-       style="border-collapse:collapse;min-width:620px">
+       style="border-collapse:collapse;min-width:680px">
   <tr style="background:#4472C4;color:#fff">
     <th>Title</th><th>Year</th><th>Type</th><th>Platform</th>
-    <th>Country</th><th>Date Added</th><th>Languages</th>
+    <th>Country</th><th>Date Added</th><th>Languages</th><th>IMDb</th>
   </tr>
   {tamil_html}
 </table>"""
@@ -375,7 +426,7 @@ def _build_html_body(rows):
 <table border="1" cellpadding="6" cellspacing="0"
        style="border-collapse:collapse;min-width:520px">
   <tr style="background:#4472C4;color:#fff">
-    <th>Title</th><th>Year</th><th>Type</th><th>Platform</th><th>Date Added</th>
+    <th>Title</th><th>Year</th><th>Type</th><th>Platform</th><th>Date Added</th><th>IMDb</th>
   </tr>
   {top5_html}
 </table>
@@ -503,6 +554,8 @@ def main():
                 "platform": platform,
                 "country": country.upper(),
                 "date_added": date_added,
+                "imdb_id": show.get("imdbId", ""),
+                "imdb_rating": None,
             })
 
     # Sort: US first then IN → platform (Netflix, Prime Video, Hulu, …)
@@ -517,11 +570,20 @@ def main():
         platform_order.get(r["platform"], 99),                # within groups
     ))
 
-    # Write CSV
+    # Enrich with IMDb ratings
+    ratings = fetch_imdb_ratings(rows)
+    for r in rows:
+        imdb_id = r.get("imdb_id", "")
+        if imdb_id and imdb_id in ratings:
+            r["imdb_rating"] = ratings[imdb_id]
+
+    # Write CSV (replace None ratings with empty string for clean output)
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        for r in rows:
+            csv_row = {k: (v if v is not None else "") for k, v in r.items()}
+            writer.writerow(csv_row)
 
     log.info("Wrote %d record(s) to %s", len(rows), OUTPUT_CSV)
 
