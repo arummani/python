@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
 Fetch newly added Indian movies, web-series, and documentaries from major
-streaming platforms using the Streaming Availability API on RapidAPI.
+streaming platforms using the OTT Details API on RapidAPI.
 Optionally email the results as an Excel attachment via Gmail SMTP.
 
 Platforms queried:
   US region : Netflix, Prime Video, Hulu, Zee5
   IN region : Netflix, Prime Video, Hotstar, Zee5
 
-Note: Aha and SunNxt are not supported by the Streaming Availability API.
-      Hotstar is not available in the US region via this API.
-      These limitations are logged as warnings at runtime.
+Data flow:
+  1. /getnew   — paginated new arrivals per region
+  2. /getTitleDetails — enrich each title with IMDb rating & genres
 
 Usage:
-    export RAPIDAPI_KEY="your-rapidapi-key"
-    export OMDB_API_KEY="your-omdb-key"       # free at https://www.omdbapi.com/apikey.aspx
+    export OTT_DETAILS_API_KEY="your-rapidapi-key"
 
     # Optional – enable email delivery:
     export SENDER_EMAIL="you@gmail.com"
@@ -45,10 +44,9 @@ from openpyxl.styles import Alignment, Font, PatternFill
 # Configuration
 # ---------------------------------------------------------------------------
 
-API_KEY = os.environ.get("RAPIDAPI_KEY", "")
-OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "")
-BASE_URL = "https://streaming-availability.p.rapidapi.com"
-OMDB_URL = "http://www.omdbapi.com/"
+OTT_API_KEY = os.environ.get("OTT_DETAILS_API_KEY", "")
+OTT_BASE_URL = "https://ott-details.p.rapidapi.com"
+OTT_HOST = "ott-details.p.rapidapi.com"
 OUTPUT_CSV = "indian_streaming_content.csv"
 LOOKBACK_DAYS = 7
 CSV_FIELDS = ["title", "year", "type", "languages", "platform", "country", "date_added",
@@ -61,47 +59,28 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 
-# Rate-limit / throttle settings for the Streaming Availability API.
+# Rate-limit / throttle settings.
 MAX_RETRIES = 5             # retries per request on HTTP 429
 BACKOFF_BASE = 2            # exponential base (2s, 4s, 8s …)
 BACKOFF_CAP = 60            # never sleep longer than this (seconds)
-PAGE_DELAY = 0.3            # seconds to sleep between consecutive API calls
+PAGE_DELAY = 0.5            # seconds to sleep between consecutive API calls
 MAX_PAGES_PER_REGION = 20   # stop paging after this many pages per region
+DETAIL_DELAY = 0.3          # seconds to sleep between /getTitleDetails calls
 
-# Catalogs to query per country.  Only services that the API actually
-# supports in each region are listed here.
-COUNTRY_CATALOGS = {
-    "us": ["netflix", "prime", "hulu", "zee5"],
-    "in": ["netflix", "prime", "hotstar", "zee5"],
+# Regions and the platform names we care about (case-insensitive match).
+REGIONS = ["US", "IN"]
+TARGET_PLATFORMS = {
+    "netflix", "prime video", "amazon prime video",
+    "hulu", "hotstar", "disney+ hotstar", "jiocinema",
+    "zee5", "zee 5",
 }
 
-# Services the user requested but that the API does not support.
-UNSUPPORTED_SERVICES = ["aha", "sunnxt"]
-
-# Indian languages — ISO 639-2 three-letter codes (the format the API uses).
-INDIAN_LANG_CODES = {
-    "hin",  # Hindi
-    "tam",  # Tamil
-    "tel",  # Telugu
-    "mal",  # Malayalam
-    "kan",  # Kannada
-    "ben",  # Bengali
-    "mar",  # Marathi
-    "guj",  # Gujarati
-    "pan",  # Punjabi
-    "ori",  # Odia
-    "asm",  # Assamese
-    "urd",  # Urdu
-    "san",  # Sanskrit
-    "nep",  # Nepali
-    "snd",  # Sindhi
-    "kok",  # Konkani
-    "mni",  # Manipuri
-    "doi",  # Dogri
-    "sat",  # Santali
-    "mai",  # Maithili
-    "kas",  # Kashmiri
-    "bho",  # Bhojpuri
+# Readable Indian language names (OTT Details returns full names, not codes).
+INDIAN_LANGUAGE_NAMES = {
+    "hindi", "tamil", "telugu", "malayalam", "kannada", "bengali",
+    "marathi", "gujarati", "punjabi", "odia", "assamese", "urdu",
+    "sanskrit", "nepali", "sindhi", "konkani", "manipuri", "dogri",
+    "santali", "maithili", "kashmiri", "bhojpuri",
 }
 
 logging.basicConfig(
@@ -113,17 +92,17 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# API helpers
+# API helpers (OTT Details)
 # ---------------------------------------------------------------------------
 
 class RateLimitExhausted(Exception):
     """All retries exhausted on HTTP 429 — caller should handle gracefully."""
 
 
-def _headers():
+def _ott_headers():
     return {
-        "X-RapidAPI-Key": API_KEY,
-        "X-RapidAPI-Host": "streaming-availability.p.rapidapi.com",
+        "X-RapidAPI-Key": OTT_API_KEY,
+        "X-RapidAPI-Host": OTT_HOST,
     }
 
 
@@ -167,104 +146,158 @@ def call_with_backoff(method, url, *, params=None, headers=None,
     raise RateLimitExhausted(f"429 after {max_retries} retries: {url}")
 
 
-def fetch_changes(country, catalogs, from_timestamp):
-    """Page through the /changes endpoint and return (changes, shows).
+# ---------------------------------------------------------------------------
+# OTT Details: /getnew — paginated new arrivals per region
+# ---------------------------------------------------------------------------
 
-    All catalogs for a region are sent in a single comma-separated request
-    (the API accepts up to 32 catalogs at once) to minimise call count.
+def fetch_new_arrivals(region):
+    """Page through /getnew for *region* and return a list of raw title dicts.
 
-    Pagination is capped at ``MAX_PAGES_PER_REGION`` pages.  A small delay
-    of ``PAGE_DELAY`` seconds is inserted between pages.
-
-    If a ``RateLimitExhausted`` error occurs mid-pagination, whatever data
-    has been collected so far is returned with a warning.
+    Pagination is capped at ``MAX_PAGES_PER_REGION``.  A delay of
+    ``PAGE_DELAY`` seconds is inserted between pages.  If rate limiting
+    exhausts retries mid-pagination, already-collected results are returned.
     """
-    all_changes = []
-    all_shows = {}
-    cursor = None
-    page = 0
+    all_results = []
+    page = 1
 
-    while True:
-        params = {
-            "country": country,
-            "catalogs": ",".join(catalogs),
-            "change_type": "new",
-            "item_type": "show",
-            "from": int(from_timestamp),
-        }
-        if cursor:
-            params["cursor"] = cursor
-
+    while page <= MAX_PAGES_PER_REGION:
         try:
             resp = call_with_backoff(
-                "GET", f"{BASE_URL}/changes",
-                params=params, headers=_headers(),
+                "GET", f"{OTT_BASE_URL}/getnew",
+                params={"region": region, "page": str(page)},
+                headers=_ott_headers(),
             )
         except RateLimitExhausted:
             log.warning(
                 "Rate limit exhausted for %s after %d page(s) — "
-                "continuing with %d change(s) already collected.",
-                country.upper(), page, len(all_changes),
+                "continuing with %d title(s) already collected.",
+                region, page - 1, len(all_results),
             )
             break
 
         data = resp.json()
-        all_changes.extend(data.get("changes", []))
-        all_shows.update(data.get("shows", {}))
+        results = data.get("results", [])
+
+        if len(results) <= 1:
+            # API signals end-of-data with an empty or single-element page.
+            all_results.extend(results)
+            break
+
+        all_results.extend(results)
+        log.info("  %s page %d → %d title(s)", region, page, len(results))
         page += 1
+        time.sleep(PAGE_DELAY)
 
-        if not data.get("hasMore"):
-            break
-
-        if page >= MAX_PAGES_PER_REGION:
-            log.info(
-                "Reached page cap (%d) for %s — stopping pagination.",
-                MAX_PAGES_PER_REGION, country.upper(),
-            )
-            break
-
-        cursor = data.get("nextCursor")
-        time.sleep(PAGE_DELAY)  # throttle between pages
-
-    return all_changes, all_shows
+    return all_results
 
 
 # ---------------------------------------------------------------------------
-# OMDb / IMDb ratings
+# OTT Details: /getTitleDetails — enrich with IMDb rating & genres
 # ---------------------------------------------------------------------------
 
-def fetch_imdb_ratings(rows):
-    """Look up IMDb ratings for every unique imdbId in *rows*.
+def fetch_title_details(imdb_ids):
+    """Fetch /getTitleDetails for each unique IMDb id.
 
-    Returns a dict ``{imdb_id: float|None}``.  Results are cached in-memory
-    so the same id is never requested twice in one run.
+    Returns ``{imdb_id: detail_dict}`` with in-memory caching.
     """
-    if not OMDB_API_KEY:
-        log.warning("OMDB_API_KEY not set — skipping IMDb rating lookups.")
-        return {}
-
     cache = {}
-    unique_ids = {r["imdb_id"] for r in rows if r.get("imdb_id")}
-    log.info("Fetching IMDb ratings for %d unique title(s)…", len(unique_ids))
+    ids = sorted(set(imdb_ids))
+    if not ids:
+        return cache
 
-    for imdb_id in unique_ids:
-        if imdb_id in cache:
-            continue
+    log.info("Enriching %d unique title(s) via /getTitleDetails …", len(ids))
+    for i, imdb_id in enumerate(ids):
         try:
-            resp = requests.get(
-                OMDB_URL,
-                params={"apikey": OMDB_API_KEY, "i": imdb_id},
-                timeout=10,
+            resp = call_with_backoff(
+                "GET", f"{OTT_BASE_URL}/getTitleDetails",
+                params={"imdbid": imdb_id},
+                headers=_ott_headers(),
             )
-            resp.raise_for_status()
-            data = resp.json()
-            raw = data.get("imdbRating", "N/A")
-            cache[imdb_id] = float(raw) if raw != "N/A" else None
-        except (requests.RequestException, ValueError) as exc:
-            log.warning("Could not fetch rating for %s: %s", imdb_id, exc)
-            cache[imdb_id] = None
+            cache[imdb_id] = resp.json()
+        except RateLimitExhausted:
+            log.warning(
+                "Rate limit hit during enrichment after %d/%d ids — "
+                "remaining titles will have no rating.",
+                i, len(ids),
+            )
+            break
+        except requests.HTTPError as exc:
+            log.warning("getTitleDetails failed for %s: %s", imdb_id, exc)
+
+        if i < len(ids) - 1:
+            time.sleep(DETAIL_DELAY)
 
     return cache
+
+
+def _parse_imdb_rating(detail):
+    """Extract IMDb rating as float from a title-detail dict, or None."""
+    for key in ("imdbrating", "imdbRating"):
+        raw = detail.get(key, "")
+        if raw and raw != "N/A":
+            try:
+                return float(raw)
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def _parse_genres(detail):
+    """Return a set of lower-case genre strings from a title-detail dict."""
+    genres = detail.get("genre") or detail.get("genres") or []
+    if isinstance(genres, str):
+        genres = [g.strip() for g in genres.split(",")]
+    return {g.strip().lower() for g in genres if g}
+
+
+# ---------------------------------------------------------------------------
+# Filtering & extraction helpers
+# ---------------------------------------------------------------------------
+
+def _normalise_platform(name):
+    """Return a canonical platform name for display."""
+    low = name.strip().lower()
+    mapping = {
+        "netflix": "Netflix",
+        "amazon prime video": "Prime Video",
+        "prime video": "Prime Video",
+        "hulu": "Hulu",
+        "hotstar": "Hotstar",
+        "disney+ hotstar": "Hotstar",
+        "jiocinema": "Hotstar",
+        "zee5": "Zee5",
+        "zee 5": "Zee5",
+    }
+    return mapping.get(low, name.strip())
+
+
+def _is_target_platform(name):
+    """Return True if *name* matches one of our target streaming services."""
+    return name.strip().lower() in TARGET_PLATFORMS
+
+
+def is_indian_content(languages):
+    """Return True if any language in *languages* (list of str) is Indian."""
+    return any(lang.strip().lower() in INDIAN_LANGUAGE_NAMES for lang in languages)
+
+
+def classify_type(raw_type, genres=None):
+    """Map OTT Details type + genres to the user-facing content type."""
+    if genres and "documentary" in genres:
+        return "documentary"
+    if raw_type and raw_type.strip().lower() == "series":
+        return "web-series"
+    return "movie"
+
+
+def readable_languages(languages):
+    """Return a sorted, comma-separated, title-cased language string."""
+    seen = []
+    for lang in languages:
+        name = lang.strip().title()
+        if name and name not in seen:
+            seen.append(name)
+    return ", ".join(sorted(seen))
 
 
 def _fmt_rating(val):
@@ -272,59 +305,6 @@ def _fmt_rating(val):
     if val is None:
         return "\u2013"  # en-dash
     return f"{val:.1f}"
-
-
-# ---------------------------------------------------------------------------
-# Filtering & extraction
-# ---------------------------------------------------------------------------
-
-def _audio_languages(show):
-    """Return a set of ISO 639-2 language codes from all streaming options."""
-    langs = set()
-    for options in show.get("streamingOptions", {}).values():
-        for opt in options:
-            for audio in opt.get("audios", []):
-                code = audio.get("language", "")
-                if code:
-                    langs.add(code)
-    return langs
-
-
-def is_indian_content(show):
-    """Heuristic: a show is considered Indian if any audio track uses an Indian language."""
-    return bool(_audio_languages(show) & INDIAN_LANG_CODES)
-
-
-def classify_type(show):
-    """Map the API show_type + genres to the user-facing content type."""
-    genre_ids = {g.get("id", "") for g in show.get("genres", [])}
-    if "documentary" in genre_ids:
-        return "documentary"
-    if show.get("showType") == "series":
-        return "web-series"
-    return "movie"
-
-
-def readable_languages(show):
-    """Return a human-friendly, sorted, comma-separated list of audio languages."""
-    # Map common ISO 639-2 codes to readable names.
-    code_to_name = {
-        "hin": "Hindi",    "tam": "Tamil",      "tel": "Telugu",
-        "mal": "Malayalam", "kan": "Kannada",    "ben": "Bengali",
-        "mar": "Marathi",   "guj": "Gujarati",  "pan": "Punjabi",
-        "ori": "Odia",      "asm": "Assamese",  "urd": "Urdu",
-        "san": "Sanskrit",  "nep": "Nepali",    "snd": "Sindhi",
-        "kok": "Konkani",   "mni": "Manipuri",  "doi": "Dogri",
-        "sat": "Santali",   "mai": "Maithili",  "kas": "Kashmiri",
-        "bho": "Bhojpuri",  "eng": "English",   "jpn": "Japanese",
-        "kor": "Korean",    "zho": "Chinese",   "spa": "Spanish",
-        "fra": "French",    "deu": "German",    "por": "Portuguese",
-        "ita": "Italian",   "ara": "Arabic",    "tha": "Thai",
-        "rus": "Russian",
-    }
-    codes = _audio_languages(show)
-    names = sorted(code_to_name.get(c, c) for c in codes)
-    return ", ".join(names)
 
 
 # ---------------------------------------------------------------------------
@@ -390,8 +370,6 @@ def _build_summary(rows):
 def _is_tamil(row):
     """Return True if the row's languages field includes Tamil."""
     langs_lower = row.get("languages", "").lower()
-    # Match the readable name "Tamil" as well as the short code "ta".
-    # Split on ", " so that "ta" doesn't false-match inside longer words.
     tokens = {t.strip() for t in langs_lower.split(",")}
     return "tamil" in tokens or "ta" in tokens
 
@@ -436,8 +414,8 @@ def _build_html_body(rows):
     # --- top Tamil releases: US first → IN → others, newest first ---
     tamil_country_order = {"US": 0, "IN": 1}
     tamil_rows = [r for r in rows if _is_tamil(r)]
-    tamil_rows.sort(key=lambda r: r["date_added"], reverse=True)      # newest first
-    tamil_rows.sort(key=lambda r: tamil_country_order.get(r["country"], 99))  # US → IN
+    tamil_rows.sort(key=lambda r: r["date_added"], reverse=True)
+    tamil_rows.sort(key=lambda r: tamil_country_order.get(r["country"], 99))
     if tamil_rows:
         tamil_html = ""
         for r in tamil_rows:
@@ -549,104 +527,131 @@ def send_email(rows, excel_path):
 # ---------------------------------------------------------------------------
 
 def main():
-    if not API_KEY:
+    if not OTT_API_KEY:
         log.error(
-            "RAPIDAPI_KEY environment variable is not set. "
-            "Export it before running:\n  export RAPIDAPI_KEY='your-key'"
+            "OTT_DETAILS_API_KEY environment variable is not set. "
+            "Export it before running:\n  export OTT_DETAILS_API_KEY='your-key'"
         )
         sys.exit(1)
 
-    # Warn about unsupported services
-    for svc in UNSUPPORTED_SERVICES:
-        log.warning(
-            "Service '%s' is not supported by the Streaming Availability API — skipping.", svc
-        )
-    log.warning(
-        "Hotstar is not available in the US region via this API — queried only for IN."
-    )
+    log.info("Using OTT Details API (ott-details.p.rapidapi.com)")
 
-    from_ts = int((datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).timestamp())
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
     log.info(
-        "Fetching new additions since %s (last %d days) for regions: %s",
-        datetime.fromtimestamp(from_ts, tz=timezone.utc).strftime("%Y-%m-%d"),
-        LOOKBACK_DAYS,
-        ", ".join(COUNTRY_CATALOGS.keys()),
+        "Fetching new arrivals for regions: %s  (last %d days)",
+        ", ".join(REGIONS), LOOKBACK_DAYS,
     )
 
-    rows = []
-    seen = set()
-
-    regions = list(COUNTRY_CATALOGS.items())
-    for idx, (country, catalogs) in enumerate(regions):
-        log.info("Querying %s — catalogs: %s", country.upper(), ", ".join(catalogs))
+    # ------------------------------------------------------------------
+    # Phase 1: Collect raw titles from /getnew per region
+    # ------------------------------------------------------------------
+    raw_titles = []  # list of (region, title_dict)
+    for idx, region in enumerate(REGIONS):
+        log.info("Querying /getnew for %s …", region)
         try:
-            changes, shows = fetch_changes(country, catalogs, from_ts)
+            results = fetch_new_arrivals(region)
         except requests.HTTPError as exc:
-            log.error("API error for %s: %s — skipping region.", country.upper(), exc)
+            log.error("API error for %s: %s — skipping region.", region, exc)
             continue
 
-        log.info("  %d change(s) returned, %d unique show(s)", len(changes), len(shows))
+        log.info("  %s: %d raw title(s) returned", region, len(results))
+        for title in results:
+            raw_titles.append((region, title))
 
         # Throttle between regions
-        if idx < len(regions) - 1:
+        if idx < len(REGIONS) - 1:
             time.sleep(PAGE_DELAY)
 
-        for change in changes:
-            show_id = change.get("showId")
-            if not show_id or show_id not in shows:
+    # ------------------------------------------------------------------
+    # Phase 2: Flatten to (imdb_id, platform, country) rows, filtering
+    #          for target platforms and Indian content
+    # ------------------------------------------------------------------
+    rows = []
+    seen = set()
+    imdb_ids_for_enrichment = set()
+
+    for region, title in raw_titles:
+        imdb_id = title.get("imdbid", "")
+        if not imdb_id:
+            continue
+
+        languages = title.get("language") or []
+        if isinstance(languages, str):
+            languages = [languages]
+
+        if not is_indian_content(languages):
+            continue
+
+        # Extract platforms for this region from streamingAvailability
+        streaming = title.get("streamingAvailability") or {}
+        country_map = streaming.get("country") or {}
+        platforms_for_region = country_map.get(region, [])
+
+        # If the API nests under a different key casing, try lower-case too
+        if not platforms_for_region:
+            platforms_for_region = country_map.get(region.lower(), [])
+        # Fallback: use the first available country key
+        if not platforms_for_region and country_map:
+            first_key = next(iter(country_map))
+            platforms_for_region = country_map[first_key]
+
+        for entry in platforms_for_region:
+            plat_name = entry.get("platform", "")
+            if not _is_target_platform(plat_name):
                 continue
 
-            show = shows[show_id]
-            if not is_indian_content(show):
-                continue
-
-            service_info = change.get("service", {})
-            platform = service_info.get("name") or service_info.get("id", "unknown")
-
-            key = (show_id, service_info.get("id", ""), country)
+            canonical = _normalise_platform(plat_name)
+            key = (imdb_id, canonical, region)
             if key in seen:
                 continue
             seen.add(key)
 
-            timestamp = change.get("timestamp")
-            date_added = (
-                datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
-                if timestamp
-                else ""
-            )
-
+            imdb_ids_for_enrichment.add(imdb_id)
             rows.append({
-                "title": show.get("title", ""),
-                "year": show.get("releaseYear") or show.get("firstAirYear", ""),
-                "type": classify_type(show),
-                "languages": readable_languages(show),
-                "platform": platform,
-                "country": country.upper(),
-                "date_added": date_added,
-                "imdb_id": show.get("imdbId", ""),
+                "title": title.get("title", ""),
+                "year": title.get("released") or "",
+                "type": title.get("type", "movie"),  # enriched later
+                "languages": readable_languages(languages),
+                "platform": canonical,
+                "country": region.upper(),
+                "date_added": today_str,
+                "imdb_id": imdb_id,
                 "imdb_rating": None,
             })
 
-    # Sort: US first then IN → platform (Netflix, Prime Video, Hulu, …)
-    # → date_added newest-first.  Two stable sorts achieve this cleanly.
+    log.info(
+        "After filtering: %d row(s) across %d unique title(s)",
+        len(rows), len(imdb_ids_for_enrichment),
+    )
+
+    # ------------------------------------------------------------------
+    # Phase 3: Enrich with /getTitleDetails (IMDb rating + genres)
+    # ------------------------------------------------------------------
+    details = fetch_title_details(imdb_ids_for_enrichment)
+
+    for r in rows:
+        detail = details.get(r["imdb_id"])
+        if not detail:
+            continue
+        r["imdb_rating"] = _parse_imdb_rating(detail)
+        genres = _parse_genres(detail)
+        r["type"] = classify_type(r["type"], genres)
+
+    # ------------------------------------------------------------------
+    # Phase 4: Sort, write CSV / Excel, send email
+    # ------------------------------------------------------------------
     country_order = {"US": 0, "IN": 1}
     platform_order = {"Netflix": 0, "Prime Video": 1, "Hulu": 2,
                       "Hotstar": 3, "Zee5": 4}
 
-    rows.sort(key=lambda r: r["date_added"], reverse=True)   # newest first
-    rows.sort(key=lambda r: (                                 # stable: keeps
-        country_order.get(r["country"], 99),                  # date order
-        platform_order.get(r["platform"], 99),                # within groups
+    rows.sort(key=lambda r: r["date_added"], reverse=True)
+    rows.sort(key=lambda r: (
+        country_order.get(r["country"], 99),
+        platform_order.get(r["platform"], 99),
     ))
 
-    # Enrich with IMDb ratings
-    ratings = fetch_imdb_ratings(rows)
-    for r in rows:
-        imdb_id = r.get("imdb_id", "")
-        if imdb_id and imdb_id in ratings:
-            r["imdb_rating"] = ratings[imdb_id]
-
-    # Write CSV (replace None ratings with empty string for clean output)
+    # Write CSV
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
@@ -657,7 +662,6 @@ def main():
     log.info("Wrote %d record(s) to %s", len(rows), OUTPUT_CSV)
 
     # Write Excel and (optionally) email it
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     excel_path = f"new_releases_{today_str}.xlsx"
     write_excel(rows, excel_path)
 
