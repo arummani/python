@@ -10,7 +10,7 @@ LOG_FILE="${PROJECT_DIR}/cron_streaming.log"
 
 cd "${PROJECT_DIR}"
 
-# Load environment variables (RAPIDAPI_KEY, SENDER_EMAIL, etc.)
+# Load environment variables (OTT_DETAILS_API_KEY, SENDER_EMAIL, etc.)
 if [ -f .env ]; then
     set -a
     source .env
