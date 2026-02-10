@@ -103,6 +103,7 @@ def _ott_headers():
     return {
         "X-RapidAPI-Key": OTT_API_KEY,
         "X-RapidAPI-Host": OTT_HOST,
+        "Content-Type": "application/octet-stream",
     }
 
 
@@ -176,7 +177,30 @@ def fetch_new_arrivals(region):
             break
 
         data = resp.json()
-        results = data.get("results", [])
+
+        # The API normally returns {"results": [...]}, but handle
+        # alternative shapes: a bare list, or {"message": "..."} errors.
+        if isinstance(data, list):
+            results = data
+        elif isinstance(data, dict):
+            results = data.get("results", [])
+            if not results and "message" in data:
+                log.warning(
+                    "  %s page %d — API message: %s",
+                    region, page, data["message"],
+                )
+        else:
+            results = []
+
+        # On the very first page, log the raw keys so we can debug
+        if page == 1 and not results:
+            log.warning(
+                "  %s page 1 returned 0 results. HTTP %d, "
+                "response keys: %s, body (first 500 chars): %.500s",
+                region, resp.status_code,
+                list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                resp.text,
+            )
 
         if len(results) <= 1:
             # API signals end-of-data with an empty or single-element page.
